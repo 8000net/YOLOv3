@@ -246,13 +246,20 @@ def preprocess_true_boxes(true_boxes, input_shape, anchors, num_classes):
 
     '''
     assert (true_boxes[..., 4]<num_classes).all(), 'class id must be less than num_classes'
+    
     num_layers = len(anchors)//3 # default setting
     anchor_mask = [[6,7,8], [3,4,5], [0,1,2]] if num_layers==3 else [[3,4,5], [1,2,3]]
 
+    # fix any data type problems
     true_boxes = np.array(true_boxes, dtype='float32')
     input_shape = np.array(input_shape, dtype='int32')
+    
+    # convert to mid point
     boxes_xy = (true_boxes[..., 0:2] + true_boxes[..., 2:4]) // 2
+    # convert to width and height
     boxes_wh = true_boxes[..., 2:4] - true_boxes[..., 0:2]
+    
+    # save back into the true boxes, 
     true_boxes[..., 0:2] = boxes_xy/input_shape[::-1]
     true_boxes[..., 2:4] = boxes_wh/input_shape[::-1]
 
@@ -343,37 +350,52 @@ def box_iou(b1, b2):
 
 
 def yolo_loss(args, anchors, num_classes, ignore_thresh=.5, print_loss=False):
-    '''Return yolo_loss tensor
+    '''Return yolo_loss tensor. This is wrapped as a layer Output 
+    For convenience using Keras. 
 
     Parameters
     ----------
-    yolo_outputs: list of tensor, the output of yolo_body or tiny_yolo_body
-    y_true: list of array, the output of preprocess_true_boxes
+    yolo_outputs (args[:num_layers]): list of tensor, the output of yolo_body or tiny_yolo_body
+    y_true (args[numlayers:]): list of array, the output of preprocess_true_boxes
     anchors: array, shape=(N, 2), wh
     num_classes: integer
-    ignore_thresh: float, the iou threshold whether to ignore object confidence loss
+    ignore_thresh: float, the IoU threshold whether to ignore object confidence loss
 
     Returns
     -------
-    loss: tensor, shape=(1,)
+    loss: tensor, shape=(1,), the summed losses for bounding boxes, objectness, and class prob
 
     '''
     num_layers = len(anchors)//3 # default setting
-    yolo_outputs = args[:num_layers]
+    
+    # separate out the args
+    yolo_outputs = args[:num_layers] 
     y_true = args[num_layers:]
     anchor_mask = [[6,7,8], [3,4,5], [0,1,2]] if num_layers==3 else [[3,4,5], [1,2,3]]
+    
+    # save some shapes for convenience
     input_shape = K.cast(K.shape(yolo_outputs[0])[1:3] * 32, K.dtype(y_true[0]))
     grid_shapes = [K.cast(K.shape(yolo_outputs[l])[1:3], K.dtype(y_true[0])) for l in range(num_layers)]
-    loss = 0
     m = K.shape(yolo_outputs[0])[0] # batch size, tensor
     mf = K.cast(m, K.dtype(yolo_outputs[0]))
+    
+    # init the loss
+    loss = 0
 
     for l in range(num_layers):
+        # whether an object is in this anchor
         object_mask = y_true[l][..., 4:5]
+        # 1's and 0's of the true class presence in anchor 
         true_class_probs = y_true[l][..., 5:]
 
+        # parse out the predictions
+        # raw_pred is everything, before applying sigmoid to xy and wh
         grid, raw_pred, pred_xy, pred_wh = yolo_head(yolo_outputs[l],
-             anchors[anchor_mask[l]], num_classes, input_shape, calc_loss=True)
+                                                     anchors[anchor_mask[l]], 
+                                                     num_classes, 
+                                                     input_shape, 
+                                                     calc_loss=True)
+        # Make into one tensor, for convenience
         pred_box = K.concatenate([pred_xy, pred_wh])
 
         # Darknet raw box to calculate loss.
@@ -383,6 +405,8 @@ def yolo_loss(args, anchors, num_classes, ignore_thresh=.5, print_loss=False):
         box_loss_scale = 2 - y_true[l][...,2:3]*y_true[l][...,3:4]
 
         # Find ignore mask, iterate over each of batch.
+        # Mask is the conditional for ignoring objects that are not
+        # within the specified IoU
         ignore_mask = tf.TensorArray(K.dtype(y_true[0]), size=1, dynamic_size=True)
         object_mask_bool = K.cast(object_mask, 'bool')
         def loop_body(b, ignore_mask):
@@ -396,10 +420,19 @@ def yolo_loss(args, anchors, num_classes, ignore_thresh=.5, print_loss=False):
         ignore_mask = K.expand_dims(ignore_mask, -1)
 
         # K.binary_crossentropy is helpful to avoid exp overflow.
+        # Okay, this is a weird implementation, but here goes for an explanation:
+        #  YOLO xy outputs need to pass through a sigmoid before interpretation, but that isn't yet done here
+        #  when from_logits=true, the log odds is not calculated so this becomes:
+        #  xy_pred *(1 - xy_real) + log(1 + exp(-abs(xy_pred)))
         xy_loss = object_mask * box_loss_scale * K.binary_crossentropy(raw_true_xy, raw_pred[...,0:2], from_logits=True)
+        
+        # both are already "log" scaled, so just take the square difference
         wh_loss = object_mask * box_loss_scale * 0.5 * K.square(raw_true_wh-raw_pred[...,2:4])
+        # this is straigh forard, right out of the YOLO paper
         confidence_loss = object_mask * K.binary_crossentropy(object_mask, raw_pred[...,4:5], from_logits=True)+ \
             (1-object_mask) * K.binary_crossentropy(object_mask, raw_pred[...,4:5], from_logits=True) * ignore_mask
+        
+        # class loss based on if the 
         class_loss = object_mask * K.binary_crossentropy(true_class_probs, raw_pred[...,5:], from_logits=True)
 
         xy_loss = K.sum(xy_loss) / mf
